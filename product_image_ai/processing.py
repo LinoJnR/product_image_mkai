@@ -2,7 +2,7 @@
 import io
 from functools import lru_cache
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 @lru_cache(maxsize=1)
@@ -118,3 +118,36 @@ def remove_disconnected_overlays(image, close_kernel=9, dilate_kernel=5, brightn
     out = arr.copy()
     out[keep == 0] = [255, 255, 255]
     return Image.fromarray(out)
+
+
+def erase_boxes(image, boxes):
+    """Paint one or more fractional rectangles pure white.
+
+    Each box in ``boxes`` is ``(left, top, right, bottom)`` as 0.0-1.0
+    fractions of width/height, same convention as crop_fraction. This is the
+    manual fallback for leftover arrows, labels, or ghost residue that
+    remove_disconnected_overlays could not safely separate from the product
+    (e.g. an annotation whose pixels visually touch the product edge, or a
+    faint anti-aliased halo left behind by a morphological close/dilate).
+    Run it after crop_fraction / remove_disconnected_overlays and before
+    background removal. Invalid boxes (inverted or zero-size) are skipped
+    rather than raising, so a stray UI input cannot blank the whole image.
+    """
+    width, height = image.size
+    out = image.convert('RGB').copy()
+    draw = ImageDraw.Draw(out)
+    for left, top, right, bottom in boxes:
+        left = min(max(float(left), 0.0), 1.0)
+        right = min(max(float(right), 0.0), 1.0)
+        top = min(max(float(top), 0.0), 1.0)
+        bottom = min(max(float(bottom), 0.0), 1.0)
+        if right <= left or bottom <= top:
+            continue
+        box = (
+            round(left * width),
+            round(top * height),
+            round(right * width),
+            round(bottom * height),
+        )
+        draw.rectangle(box, fill=(255, 255, 255))
+    return out
