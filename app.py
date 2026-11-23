@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image
 import streamlit as st
 from product_image_ai.ingest import MAX_ZIP_UNCOMPRESSED_BYTES, collect_uploaded_images, extract_zip_images, open_image_bytes
-from product_image_ai.processing import crop_fraction, make_white_background, remove_disconnected_overlays
+from product_image_ai.processing import crop_fraction, erase_boxes, make_white_background, remove_disconnected_overlays
 
 st.set_page_config(page_title='Product Image AI', page_icon='🖼️', layout='wide')
 st.title('🖼️ Product Image AI')
@@ -99,6 +99,45 @@ with st.expander('Remove dimension arrows / callout overlays before cleaning (op
     elif overlay_enabled:
         st.caption('Upload images above to see a live preview.')
 
+with st.expander('Manually erase leftover arrows / labels (optional)'):
+    st.caption(
+        'Use this to finish off anything the automatic overlay removal above could not safely take out, most often '
+        'a dimension arrow or label that visually touches the product edge (so the automatic tool cannot tell it '
+        'apart from the product) or a faint ghost edge left behind. Draw up to 5 rectangles as percentages of the '
+        'image; everything inside each rectangle is painted pure white. The same rectangles apply to every image in '
+        'this batch, so this works best when all uploaded images share the same layout. Runs after crop and after '
+        'automatic overlay removal, before background removal.'
+    )
+    erase_enabled = st.checkbox('Erase rectangles before cleaning', value=False, key='erase_enabled')
+    erase_count = st.number_input('Number of rectangles', min_value=0, max_value=5, value=1 if erase_enabled else 0, step=1, key='erase_count', disabled=not erase_enabled)
+    erase_box_fractions = []
+    for i in range(int(erase_count)):
+        st.caption(f'Rectangle {i + 1}')
+        e1, e2, e3, e4 = st.columns(4)
+        e_left = e1.number_input('Left %', 0.0, 100.0, 0.0, step=1.0, key=f'erase_left_{i}', disabled=not erase_enabled)
+        e_top = e2.number_input('Top %', 0.0, 100.0, 0.0, step=1.0, key=f'erase_top_{i}', disabled=not erase_enabled)
+        e_right = e3.number_input('Right %', 0.0, 100.0, 10.0, step=1.0, key=f'erase_right_{i}', disabled=not erase_enabled)
+        e_bottom = e4.number_input('Bottom %', 0.0, 100.0, 100.0, step=1.0, key=f'erase_bottom_{i}', disabled=not erase_enabled)
+        erase_box_fractions.append((e_left / 100.0, e_top / 100.0, e_right / 100.0, e_bottom / 100.0))
+
+    if erase_enabled and image_files:
+        try:
+            preview_bytes = image_files[0].getvalue()
+            with Image.open(io.BytesIO(preview_bytes)) as preview_image:
+                preview_image.load()
+                preview_rgb = preview_image.convert('RGB')
+                if st.session_state.get('crop_enabled'):
+                    preview_rgb = crop_fraction(preview_rgb, *crop_box_fraction)
+                if st.session_state.get('overlay_enabled'):
+                    preview_rgb = remove_disconnected_overlays(preview_rgb, close_kernel=overlay_sensitivity)
+                preview_erased = erase_boxes(preview_rgb, erase_box_fractions)
+            st.caption(f'Preview on "{image_files[0].name}" (after crop and automatic overlay removal, if enabled):')
+            st.image(preview_erased, use_container_width=False, width=260)
+        except Exception as exc:
+            st.warning(f'Could not preview the erase rectangles: {exc}')
+    elif erase_enabled:
+        st.caption('Upload images above to see a live preview.')
+
 if st.button('Clean backgrounds', type='primary', use_container_width=True):
     uploaded, failures = collect_uploaded_images(image_files or [])
     if zip_file is not None:
@@ -143,7 +182,10 @@ if st.button('Clean backgrounds', type='primary', use_container_width=True):
                 if st.session_state.get('crop_enabled'):
                     image = crop_fraction(image, *crop_box_fraction)
                 if st.session_state.get('overlay_enabled'):
-                    image = remove_disconnected_overlays(image, close_kernel=overlay_sensitivity).convert('RGBA')
+                    image = remove_disconnected_overlays(image, close_kernel=overlay_sensitivity)
+                if st.session_state.get('erase_enabled'):
+                    image = erase_boxes(image, erase_box_fractions)
+                image = image.convert('RGBA')
                 result = make_white_background(image, remove_bg=True, transparent=False)
                 output = io.BytesIO()
                 result.save(output, format='JPEG', quality=95, optimize=True)
