@@ -1,169 +1,120 @@
-
-"""Image processing for Product Image AI.
-
-Uses U2Net through rembg to create a foreground mask.
-Original image pixels are retained wherever the mask identifies
-the foreground.
-"""
-
+"""Memory-conscious background processing with cached model initialization."""
 import io
 from functools import lru_cache
 
-from PIL import Image, ImageFilter
+from PIL import Image
 
 
 @lru_cache(maxsize=1)
 def _get_rembg_session():
-    """Load and cache the U2Net model."""
+    """Initialize the CPU model once; rembg downloads its model on first use."""
     try:
         from rembg import new_session
-
-        return new_session("u2net")
-
+        return new_session('u2net')
     except Exception as exc:
         raise RuntimeError(
-            "Could not initialize the background-removal AI model. "
-            "Check the internet connection for the first model download, "
-            "available memory and model-cache permissions. "
-            f"Details: {exc}"
+            'Could not initialize the background-removal AI model. Check the internet '
+            'connection for the first model download, available memory, and write access '
+            'to the model cache, then restart the app. Details: ' + str(exc)
         ) from exc
 
 
-def create_foreground_mask(image):
-    """Generate a foreground mask using U2Net."""
-
-    try:
-        from rembg import remove
-
-        original = image.convert("RGBA")
-
-        buffer = io.BytesIO()
-        original.save(buffer, format="PNG")
-
-        session = _get_rembg_session()
-
-        mask_bytes = remove(
-            buffer.getvalue(),
-            only_mask=True,
-            session=session,
-        )
-
-        with Image.open(io.BytesIO(mask_bytes)) as mask_image:
-
-            mask = mask_image.convert("L")
-
-            if mask.size != original.size:
-                mask = mask.resize(
-                    original.size,
-                    Image.Resampling.LANCZOS,
-                )
-
-            # Slightly soften mask edges to reduce harsh cut-outs.
-            mask = mask.filter(
-                ImageFilter.GaussianBlur(radius=0.5)
-            )
-
-            return mask
-
-    except ImportError as exc:
-        raise RuntimeError(
-            "Background removal is not installed. "
-            "Run pip install -r requirements.txt."
-        ) from exc
-
-    except RuntimeError:
-        raise
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Foreground mask generation failed: {exc}"
-        ) from exc
-
-
-def make_white_background(
-    image,
-    remove_bg=True,
-    transparent=False,
-):
-    """Remove the background and preserve original foreground pixels."""
-
-    original = image.convert("RGBA")
-
-    if remove_bg:
-
-        mask = create_foreground_mask(original)
-
-        foreground = original.copy()
-        foreground.putalpha(mask)
-
-    else:
+def make_white_background(image, remove_bg=True, transparent=False):
+    """Apply a mask to original RGB pixels and composite on pure white."""
+    original = image.convert('RGBA')
+    if not remove_bg:
         foreground = original
+    else:
+        try:
+            from rembg import remove
+            session = _get_rembg_session()
+            source_buffer = io.BytesIO()
+            original.save(source_buffer, format='PNG')
+            mask_bytes = remove(source_buffer.getvalue(), only_mask=True, session=session)
+            with Image.open(io.BytesIO(mask_bytes)) as mask_image:
+                mask = mask_image.convert('L')
+                if mask.size != original.size:
+                    mask = mask.resize(original.size, Image.Resampling.LANCZOS)
+                foreground = original.copy()
+                foreground.putalpha(mask)
+        except ImportError as exc:
+            raise RuntimeError(
+                "Background removal is not installed. Run 'pip install -r requirements.txt'."
+            ) from exc
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f'Background removal failed for this image: {exc}') from exc
 
     if transparent:
         return foreground
-
-    white_background = Image.new(
-        "RGBA",
-        original.size,
-        (255, 255, 255, 255),
-    )
-
-    white_background.alpha_composite(foreground)
-
-    return white_background.convert("RGB")
+    white = Image.new('RGBA', original.size, (255, 255, 255, 255))
+    white.alpha_composite(foreground)
+    return white.convert('RGB')
 
 
-def apply_brush_edits(
-    current_result,
-    original_image,
-    mask,
-    action="restore",
-):
-    """Apply manual Restore or Remove brush corrections.
+def crop_fraction(image, left=0.0, top=0.0, right=1.0, bottom=1.0):
+    """Crop an image using fractional bounds (0.0-1.0) of its width/height.
 
-    Restore uses original image pixels.
-    Remove paints the selected area white.
+    Useful for isolating one product panel out of a composite/multi-panel
+    screenshot (e.g. a marketplace listing image that stitches a studio shot
+    and a lifestyle shot side by side) before background removal runs.
+    Fractions are clamped and ordered defensively so a bad preset/slider
+    value cannot produce a zero-size or inverted crop.
     """
+    width, height = image.size
+    left = min(max(float(left), 0.0), 1.0)
+    right = min(max(float(right), 0.0), 1.0)
+    top = min(max(float(top), 0.0), 1.0)
+    bottom = min(max(float(bottom), 0.0), 1.0)
+    if right <= left:
+        left, right = 0.0, 1.0
+    if bottom <= top:
+        top, bottom = 0.0, 1.0
+    box = (
+        round(left * width),
+        round(top * height),
+        max(round(right * width), round(left * width) + 1),
+        max(round(bottom * height), round(top * height) + 1),
+    )
+    return image.crop(box)
 
-    current = current_result.convert("RGBA")
-    original = original_image.convert("RGBA")
-    edit_mask = mask.convert("L")
 
-    if original.size != current.size:
-        original = original.resize(
-            current.size,
-            Image.Resampling.LANCZOS,
-        )
+def remove_disconnected_overlays(image, close_kernel=9, dilate_kernel=5, brightness_threshold=240):
+    """Strip dimension arrows, measurement labels, and other callout overlays
+    that sit in the plain background around a product (common in marketplace
+    screenshots that annotate width/height/depth with arrows and text).
 
-    if edit_mask.size != current.size:
-        edit_mask = edit_mask.resize(
-            current.size,
-            Image.Resampling.NEAREST,
-        )
+    These overlays are disconnected from the product in pixel space. This
+    isolates the single largest connected dark shape (the product) and
+    whitens every other separate shape. A product with disconnected parts in
+    the photo itself (e.g. a two-piece item shot with a visible gap) will
+    lose the smaller piece, so this is meant to run before background
+    removal, as an optional pre-cleaning step, not a universal default.
+    """
+    import numpy as np
+    import cv2
 
-    if action == "restore":
+    rgb = image.convert('RGB')
+    arr = np.array(rgb)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    mask = (gray < brightness_threshold).astype(np.uint8)
 
-        return Image.composite(
-            original,
-            current,
-            edit_mask,
-        )
+    if close_kernel > 0:
+        kernel = np.ones((close_kernel, close_kernel), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    elif action == "remove":
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return rgb  # nothing non-white was detected; leave the image untouched
 
-        white = Image.new(
-            "RGBA",
-            current.size,
-            (255, 255, 255, 255),
-        )
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_label = 1 + int(np.argmax(areas))
+    keep = (labels == largest_label).astype(np.uint8)
 
-        return Image.composite(
-            white,
-            current,
-            edit_mask,
-        )
+    if dilate_kernel > 0:
+        keep = cv2.dilate(keep, np.ones((dilate_kernel, dilate_kernel), np.uint8), iterations=1)
 
-    else:
-        raise ValueError(
-            "Invalid brush action. Use 'restore' or 'remove'."
-        )
+    out = arr.copy()
+    out[keep == 0] = [255, 255, 255]
+    return Image.fromarray(out)
